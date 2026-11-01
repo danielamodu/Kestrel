@@ -685,3 +685,219 @@ fn parse_line(
     }
     Ok(None)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ParserEvent, RespParser};
+    use crate::protocol::error::ProtocolError;
+    use crate::protocol::limits::ProtocolLimits;
+    use crate::protocol::value::RespValue;
+    use crate::protocol::writer::encode;
+
+    fn cmd(args: &[&[u8]]) -> Vec<RespValue> {
+        args.iter()
+            .map(|arg| RespValue::BulkString(Some(arg.to_vec())))
+            .collect()
+    }
+
+    #[test]
+    fn parses_one_command() {
+        let mut parser = RespParser::new();
+        let event = parser.feed(b"*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n");
+        assert_eq!(event, ParserEvent::Commands(vec![cmd(&[b"ECHO", b"hi"])]));
+        assert_eq!(parser.take_error(), None);
+    }
+
+    #[test]
+    fn retains_partial_frames_across_feeds() {
+        let mut parser = RespParser::new();
+        assert_eq!(parser.feed(b"*1\r\n$4\r\nPI"), ParserEvent::Incomplete);
+        assert_eq!(parser.take_error(), None);
+        assert_eq!(
+            parser.feed(b"NG\r\n"),
+            ParserEvent::Commands(vec![cmd(&[b"PING"])])
+        );
+    }
+
+    #[test]
+    fn batches_pipelined_commands() {
+        let mut parser = RespParser::new();
+        let event = parser.feed(b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n");
+        assert_eq!(
+            event,
+            ParserEvent::Commands(vec![cmd(&[b"PING"]), cmd(&[b"PING"])])
+        );
+    }
+
+    #[test]
+    fn emits_valid_batch_then_latches_error() {
+        let mut parser = RespParser::new();
+        let event = parser.feed(b"*1\r\n$4\r\nPING\r\n*x\r\n");
+        assert_eq!(event, ParserEvent::Commands(vec![cmd(&[b"PING"])]));
+        assert_eq!(
+            parser.take_error(),
+            Some(ProtocolError::InvalidInteger {
+                field: "array length"
+            })
+        );
+        assert_eq!(parser.take_error(), None);
+        assert!(matches!(
+            parser.feed(b"*1\r\n$4\r\nPING\r\n"),
+            ParserEvent::ProtocolError(_)
+        ));
+    }
+
+    #[test]
+    fn null_top_level_array_is_rejected() {
+        let mut parser = RespParser::new();
+        assert_eq!(
+            parser.feed(b"*-1\r\n"),
+            ParserEvent::ProtocolError(ProtocolError::NullCommandArray)
+        );
+    }
+
+    #[test]
+    fn non_array_top_level_is_rejected() {
+        let mut parser = RespParser::new();
+        assert_eq!(
+            parser.feed(b"+OK\r\n"),
+            ParserEvent::ProtocolError(ProtocolError::ExpectedArray { found: b'+' })
+        );
+    }
+
+    #[test]
+    fn applies_limits_before_allocating() {
+        let limits = ProtocolLimits {
+            max_bulk_len: 4,
+            max_array_len: 2,
+            max_request_size: 64,
+            max_nesting_depth: 8,
+        };
+        let mut parser = RespParser::with_limits(limits);
+        assert_eq!(
+            parser.feed(b"*1\r\n$5\r\nhello\r\n"),
+            ParserEvent::ProtocolError(ProtocolError::BulkTooLong { len: 5, limit: 4 })
+        );
+
+        let mut parser = RespParser::with_limits(limits);
+        assert_eq!(
+            parser.feed(b"*3\r\n:1\r\n:2\r\n:3\r\n"),
+            ParserEvent::ProtocolError(ProtocolError::ArrayTooLarge { len: 3, limit: 2 })
+        );
+    }
+
+    #[test]
+    fn empty_feed_is_incomplete() {
+        let mut parser = RespParser::new();
+        assert_eq!(parser.feed(b""), ParserEvent::Incomplete);
+        assert!(!parser.is_failed());
+    }
+
+    /// Regression for quadratic re-parsing: every bulk payload must be copied
+    /// exactly once no matter how finely the frame is fragmented. The old
+    /// restart-from-scratch parser re-copied all completed elements on every
+    /// feed, which this count would expose immediately.
+    #[test]
+    fn large_array_fed_byte_by_byte_copies_each_payload_once() {
+        let payloads: Vec<Vec<u8>> = (0..128)
+            .map(|index| vec![b'a' + (index % 26) as u8; 256])
+            .collect();
+        let elements: Vec<RespValue> = payloads
+            .iter()
+            .map(|payload| RespValue::BulkString(Some(payload.clone())))
+            .collect();
+        let frame = encode(&RespValue::Array(Some(elements.clone())));
+
+        let mut parser = RespParser::new();
+        let mut batches = Vec::new();
+        for byte in &frame {
+            if let ParserEvent::Commands(mut batch) = parser.feed(std::slice::from_ref(byte)) {
+                batches.append(&mut batch);
+            }
+        }
+
+        assert_eq!(batches, vec![elements]);
+        let total: u64 = payloads.iter().map(|p| p.len() as u64).sum();
+        assert_eq!(
+            parser.stats.payload_bytes_copied, total,
+            "each payload byte must be copied exactly once"
+        );
+    }
+
+    /// Regression for quadratic line scanning: a long `+` element fed one byte
+    /// at a time must be scanned a linear number of bytes in total.
+    #[test]
+    fn long_line_fed_byte_by_byte_is_scanned_once() {
+        const TEXT_LEN: usize = 64 * 1024;
+        let text = "a".repeat(TEXT_LEN);
+        let frame = format!("*1\r\n+{text}\r\n");
+
+        let mut parser = RespParser::new();
+        let mut batches = Vec::new();
+        for byte in frame.as_bytes() {
+            if let ParserEvent::Commands(mut batch) = parser.feed(std::slice::from_ref(byte)) {
+                batches.append(&mut batch);
+            }
+        }
+
+        assert_eq!(batches, vec![vec![RespValue::SimpleString(text)]]);
+        // A restart-from-scratch scan would examine ~TEXT_LEN²/2 bytes.
+        assert!(
+            parser.stats.line_bytes_scanned < 3 * TEXT_LEN as u64,
+            "line scanning examined {} bytes",
+            parser.stats.line_bytes_scanned
+        );
+    }
+
+    /// Each pipelined command gets its own size budget.
+    #[test]
+    fn pipelined_commands_are_accounted_per_command() {
+        let limits = ProtocolLimits {
+            max_bulk_len: 4,
+            max_array_len: 2,
+            max_request_size: 14,
+            max_nesting_depth: 4,
+        };
+        let frame = b"*1\r\n$4\r\nabcd\r\n"; // exactly 14 bytes
+        let mut stream = Vec::new();
+        for _ in 0..3 {
+            stream.extend_from_slice(frame);
+        }
+
+        let mut parser = RespParser::with_limits(limits);
+        assert_eq!(
+            parser.feed(&stream),
+            ParserEvent::Commands(vec![cmd(&[b"abcd"]); 3])
+        );
+        assert_eq!(parser.take_error(), None);
+    }
+
+    /// An oversized *partial* request must be reported even when a valid batch
+    /// was emitted in the same call.
+    #[test]
+    fn oversized_partial_after_valid_batch_is_latched() {
+        let limits = ProtocolLimits {
+            max_bulk_len: 16,
+            max_array_len: 4,
+            max_request_size: 16,
+            max_nesting_depth: 4,
+        };
+        let mut data = b"*1\r\n+ok\r\n".to_vec(); // 9 bytes, valid command
+        data.extend_from_slice(b"*1\r\n+"); // second request starts
+        data.extend(std::iter::repeat_n(b'a', 20)); // partial line: 4 + 21 bytes
+
+        let mut parser = RespParser::with_limits(limits);
+        assert_eq!(
+            parser.feed(&data),
+            ParserEvent::Commands(vec![vec![RespValue::SimpleString("ok".into())]])
+        );
+        assert_eq!(
+            parser.take_error(),
+            Some(ProtocolError::RequestTooLarge {
+                size: 25,
+                limit: 16
+            })
+        );
+        assert_eq!(parser.take_error(), None);
+    }
+}
