@@ -86,3 +86,33 @@ impl fmt::Display for ProtocolError {
 
 impl std::error::Error for ProtocolError {}
 
+#[cfg(test)]
+mod tests {
+    use super::ProtocolError;
+
+    #[test]
+    fn limit_messages_match_the_architecture() {
+        // The server replies with `-ERR {error}`; these must stay byte-exact.
+        assert_eq!(
+            ProtocolError::BulkTooLong { len: 10, limit: 5 }.to_string(),
+            "value is too long"
+        );
+        assert_eq!(
+            ProtocolError::ArrayTooLarge { len: 3, limit: 2 }.to_string(),
+            "protocol error: array too large"
+        );
+        assert_eq!(
+            ProtocolError::RequestTooLarge { size: 9, limit: 8 }.to_string(),
+            "protocol error: request too large"
+        );
+    }
+
+    #[test]
+    fn non_printable_bytes_are_rendered_as_hex() {
+        let err = ProtocolError::ExpectedArray { found: 0x00 };
+        assert_eq!(
+            err.to_string(),
+            "protocol error: expected array, got byte 0x00"
+        );
+    }
+}
