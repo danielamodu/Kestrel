@@ -201,7 +201,9 @@ Configurable limits (server config / parser configuration):
 |---|---|---|
 | `max_bulk_len` | 512 MiB | Redis `proto-max-bulk-len` default |
 | `max_array_len` | 1024 | Redis `proto-max-array-size` default |
-| `max_request_size` | 512 MiB | Total-request ceiling (configurable) |
+| `max_request_size` | 512 MiB | Per top-level request ceiling (configurable) |
+
+`max_request_size` scopes exactly one encoded top-level request (one command array, from its leading `*` through its final `\r\n`). It is deliberately **not** a ceiling on how much input a single read or `feed` call may carry: pipelined commands are accounted one at a time, so a batch of many individually valid commands is always accepted regardless of aggregate length. The retained buffer is bounded separately: it holds only the current incomplete element, and its length plus the bytes already accounted for the request in progress is checked against `max_request_size`.
 
 Parser buffer: `Vec<u8>` with incremental growth, bounded by `max_request_size`; per-element limit checks applied before copying element bodies. Violations → `ProtocolError` (→ error reply + close):
 - bulk length > `max_bulk_len` → `-ERR value is too long`
