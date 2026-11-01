@@ -646,6 +646,138 @@ fn default_depth_limit_blocks_deep_nesting() {
 }
 
 // ---------------------------------------------------------------------------
+// Request-size semantics
+//
+// `max_request_size` bounds one top-level command. It is deliberately *not* a
+// bound on how much input a caller may feed at once.
+// ---------------------------------------------------------------------------
+
+/// Handy limits for the cases below: a 14-byte command fits exactly.
+fn tight_request_limits(max_request_size: u64) -> ProtocolLimits {
+    ProtocolLimits {
+        max_bulk_len: 64,
+        max_array_len: 4,
+        max_request_size,
+        max_nesting_depth: 8,
+    }
+}
+
+/// `PING`-sized frame, exactly 14 bytes.
+const SMALL_COMMAND: &[u8] = b"*1\r\n$4\r\nabcd\r\n";
+
+/// A 200-command pipeline is ~2.8 KiB. The aggregate is far past the 14-byte
+/// per-command limit and must still be accepted.
+#[test]
+fn pipelined_commands_are_limited_per_command_not_in_aggregate() {
+    let mut stream = Vec::new();
+    for _ in 0..200 {
+        stream.extend_from_slice(SMALL_COMMAND);
+    }
+    assert!(stream.len() > 14 * 100);
+
+    let mut parser = RespParser::with_limits(tight_request_limits(14));
+    assert_eq!(
+        parser.feed(&stream),
+        ParserEvent::Commands(vec![vec![bulk(b"abcd")]; 200])
+    );
+    assert_eq!(parser.take_error(), None);
+}
+
+/// Fragmentation must not change accounting: every split of a 3-command
+/// pipeline at the per-command limit stays valid.
+#[test]
+fn pipelined_commands_at_the_limit_survive_every_split() {
+    let mut stream = Vec::new();
+    for _ in 0..3 {
+        stream.extend_from_slice(SMALL_COMMAND);
+    }
+    let expected = vec![vec![bulk(b"abcd")]; 3];
+
+    for split in 0..=stream.len() {
+        let mut parser = RespParser::with_limits(tight_request_limits(14));
+        let mut batches = Vec::new();
+        for part in [&stream[..split], &stream[split..]] {
+            if let ParserEvent::Commands(mut batch) = parser.feed(part) {
+                batches.append(&mut batch);
+            }
+        }
+        assert_eq!(batches, expected, "split {split}");
+        assert!(!parser.is_failed(), "split {split}");
+        assert_eq!(parser.take_error(), None, "split {split}");
+    }
+}
+
+/// The aggregate limit does not apply, but an individually oversized command
+/// is still rejected — after the valid prefix has been delivered.
+#[test]
+fn oversized_command_in_a_pipeline_is_rejected_after_the_valid_prefix() {
+    let mut stream = SMALL_COMMAND.to_vec();
+    stream.extend_from_slice(b"*2\r\n$3\r\nabc\r\n$3\r\nabc\r\n"); // 22 bytes
+
+    let mut parser = RespParser::with_limits(tight_request_limits(14));
+    assert_eq!(
+        parser.feed(&stream),
+        ParserEvent::Commands(vec![vec![bulk(b"abcd")]])
+    );
+    assert_eq!(
+        parser.take_error(),
+        Some(ProtocolError::RequestTooLarge {
+            size: 22,
+            limit: 14
+        })
+    );
+    assert_eq!(parser.take_error(), None);
+}
+
+/// An incomplete request is bounded while it is still buffered: 16 bytes is
+/// allowed, 17 is not.
+#[test]
+fn retained_partial_request_respects_the_limit_boundary() {
+    let mut parser = RespParser::with_limits(tight_request_limits(16));
+
+    let mut at_limit = b"*1\r\n+".to_vec();
+    at_limit.extend(std::iter::repeat_n(b'a', 11));
+    assert_eq!(at_limit.len(), 16);
+    assert_eq!(parser.feed(&at_limit), ParserEvent::Incomplete);
+    assert!(!parser.is_failed());
+
+    assert_eq!(
+        parser.feed(b"a"),
+        ParserEvent::ProtocolError(ProtocolError::RequestTooLarge {
+            size: 17,
+            limit: 16
+        })
+    );
+}
+
+/// Growth across many feeds is charged once per new byte, so a large request
+/// split into 1-byte feeds still completes at the exact boundary.
+#[test]
+fn large_partial_request_accounts_bytes_once_across_feeds() {
+    const PAYLOAD: usize = 4096;
+    let mut frame = format!("*1\r\n${PAYLOAD}\r\n").into_bytes();
+    frame.extend(std::iter::repeat_n(b'z', PAYLOAD));
+    frame.extend_from_slice(b"\r\n");
+    let limit = frame.len() as u64;
+
+    let mut parser = RespParser::with_limits(ProtocolLimits {
+        max_bulk_len: limit,
+        max_array_len: 4,
+        max_request_size: limit,
+        max_nesting_depth: 8,
+    });
+    let mut batches = Vec::new();
+    for byte in &frame {
+        if let ParserEvent::Commands(mut batch) = parser.feed(std::slice::from_ref(byte)) {
+            batches.append(&mut batch);
+        }
+    }
+
+    assert_eq!(batches, vec![vec![bulk(&vec![b'z'; PAYLOAD])]]);
+    assert!(!parser.is_failed());
+}
+
+// ---------------------------------------------------------------------------
 // Randomized / property-style coverage
 // ---------------------------------------------------------------------------
 
