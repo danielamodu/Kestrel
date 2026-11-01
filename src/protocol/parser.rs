@@ -498,3 +498,110 @@ fn parse_line(buf: &[u8], start: usize) -> Result<Option<(&[u8], usize)>, Protoc
     Ok(None)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{ParserEvent, RespParser};
+    use crate::protocol::error::ProtocolError;
+    use crate::protocol::value::RespValue;
+
+    fn cmd(args: &[&[u8]]) -> Vec<RespValue> {
+        args.iter()
+            .map(|arg| RespValue::BulkString(Some(arg.to_vec())))
+            .collect()
+    }
+
+    #[test]
+    fn parses_one_command() {
+        let mut parser = RespParser::new();
+        let event = parser.feed(b"*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n");
+        assert_eq!(event, ParserEvent::Commands(vec![cmd(&[b"ECHO", b"hi"])]));
+        assert_eq!(parser.take_error(), None);
+    }
+
+    #[test]
+    fn retains_partial_frames_across_feeds() {
+        let mut parser = RespParser::new();
+        assert_eq!(parser.feed(b"*1\r\n$4\r\nPI"), ParserEvent::Incomplete);
+        assert_eq!(parser.take_error(), None);
+        assert_eq!(
+            parser.feed(b"NG\r\n"),
+            ParserEvent::Commands(vec![cmd(&[b"PING"])])
+        );
+    }
+
+    #[test]
+    fn batches_pipelined_commands() {
+        let mut parser = RespParser::new();
+        let event = parser.feed(b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n");
+        assert_eq!(
+            event,
+            ParserEvent::Commands(vec![cmd(&[b"PING"]), cmd(&[b"PING"])])
+        );
+    }
+
+    #[test]
+    fn emits_valid_batch_then_latches_error() {
+        let mut parser = RespParser::new();
+        let event = parser.feed(b"*1\r\n$4\r\nPING\r\n*x\r\n");
+        assert_eq!(event, ParserEvent::Commands(vec![cmd(&[b"PING"])]));
+        assert_eq!(
+            parser.take_error(),
+            Some(ProtocolError::InvalidInteger {
+                field: "array length"
+            })
+        );
+        assert_eq!(parser.take_error(), None);
+        assert!(matches!(
+            parser.feed(b"*1\r\n$4\r\nPING\r\n"),
+            ParserEvent::ProtocolError(_)
+        ));
+    }
+
+    #[test]
+    fn null_top_level_array_is_rejected() {
+        let mut parser = RespParser::new();
+        assert_eq!(
+            parser.feed(b"*-1\r\n"),
+            ParserEvent::ProtocolError(ProtocolError::NullCommandArray)
+        );
+    }
+
+    #[test]
+    fn non_array_top_level_is_rejected() {
+        let mut parser = RespParser::new();
+        assert_eq!(
+            parser.feed(b"+OK\r\n"),
+            ParserEvent::ProtocolError(ProtocolError::ExpectedArray { found: b'+' })
+        );
+    }
+
+    #[test]
+    fn applies_limits_before_allocating() {
+        use crate::protocol::limits::ProtocolLimits;
+
+        let limits = ProtocolLimits {
+            max_bulk_len: 4,
+            max_array_len: 2,
+            max_request_size: 64,
+            max_nesting_depth: 8,
+        };
+        let mut parser = RespParser::with_limits(limits);
+        assert_eq!(
+            parser.feed(b"*1\r\n$5\r\nhello\r\n"),
+            ParserEvent::ProtocolError(ProtocolError::BulkTooLong { len: 5, limit: 4 })
+        );
+
+        let mut parser = RespParser::with_limits(limits);
+        assert_eq!(
+            parser.feed(b"*3\r\n:1\r\n:2\r\n:3\r\n"),
+            ParserEvent::ProtocolError(ProtocolError::ArrayTooLarge { len: 3, limit: 2 })
+        );
+    }
+
+    #[test]
+    fn empty_feed_is_incomplete() {
+        let mut parser = RespParser::new();
+        assert_eq!(parser.feed(b""), ParserEvent::Incomplete);
+        assert!(!parser.is_failed());
+    }
+}
