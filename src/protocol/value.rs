@@ -73,3 +73,31 @@ impl RespValue {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::RespValue;
+
+    #[test]
+    fn nulls_are_reported_as_null() {
+        assert!(RespValue::null_bulk().is_null());
+        assert!(RespValue::null_array().is_null());
+        assert!(!RespValue::bulk("x").is_null());
+        assert!(!RespValue::array(Vec::new()).is_null());
+    }
+
+    #[test]
+    fn empty_bulk_is_not_null() {
+        let empty = RespValue::bulk(Vec::new());
+        assert!(!empty.is_null());
+        assert_eq!(empty.as_bulk(), Some(&[][..]));
+    }
+
+    #[test]
+    fn type_markers_are_the_resp2_markers() {
+        assert_eq!(RespValue::SimpleString("OK".into()).type_marker(), b'+');
+        assert_eq!(RespValue::Error("ERR".into()).type_marker(), b'-');
+        assert_eq!(RespValue::Integer(1).type_marker(), b':');
+        assert_eq!(RespValue::null_bulk().type_marker(), b'$');
+        assert_eq!(RespValue::null_array().type_marker(), b'*');
+    }
+}
